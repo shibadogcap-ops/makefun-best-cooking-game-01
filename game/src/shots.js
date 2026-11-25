@@ -1,79 +1,161 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createKitchen } from './kitchen.js';
+import { spawnCustomer, typeById } from './customers.js';
+import { NIGHTS } from './nights.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function nightInfo(night) {
+  const index = Math.max(0, Math.min(NIGHTS.length, night) - 1);
+  return NIGHTS[index] || NIGHTS[0];
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+function resetGame(game, night = 1) {
+  const info = nightInfo(night);
+  Object.assign(game, {
+    screen: 'title',
+    night: info.night,
+    nightTime: 0,
+    timeLeft: info.duration,
+    bank: 0,
+    totalEarned: 0,
+    nightEarned: 0,
+    served: 0,
+    lost: 0,
+    bestCombo: 0,
+    combo: 0,
+    comboTimer: 0,
+    kitchen: createKitchen(new Set()),
+    customers: [],
+    spawnTimer: 0,
+    upgrades: new Set(),
+    popups: [],
+    rush: false,
+    message: '',
+    messageT: 0,
+  });
+}
+
+function sceneCustomer(rng, night, typeId, order, patienceFrac, mood = 'waiting') {
+  const customer = spawnCustomer(rng, night);
+  const type = typeById(typeId);
+  if (type) customer.type = type;
+  if (order) customer.order = order;
+  customer.maxPatience = type ? type.patience : customer.maxPatience;
+  customer.patience = customer.maxPatience * patienceFrac;
+  customer.mood = mood;
+  return customer;
+}
+
+function numberCustomers(customers) {
+  customers.forEach((customer, index) => {
+    customer.id = index + 1;
+  });
+}
+
+function applyRush(game, rng) {
+  resetGame(game, 2);
+  game.screen = 'play';
+  game.nightTime = 44;
+  game.timeLeft = nightInfo(2).duration - game.nightTime;
+  game.rush = true;
+  game.upgrades = new Set(['second-pot']);
+  game.kitchen = createKitchen(game.upgrades);
+  game.kitchen.pots[0].state = 'perfect';
+  game.kitchen.pots[0].t = 5;
+  game.kitchen.pots[1].state = 'boiling';
+  game.kitchen.pots[1].t = 2;
+  game.kitchen.bowl = { noodles: 'perfect', broth: 'miso', toppings: ['chashu', 'egg'] };
+  game.customers = [
+    sceneCustomer(
+      rng,
+      2,
+      'salaryman',
+      { broth: 'miso', toppings: ['chashu', 'egg', 'corn', 'butter'], signature: 'Midnight Special' },
+      0.7,
+    ),
+    sceneCustomer(rng, 2, 'student', null, 0.45),
+    sceneCustomer(rng, 2, 'grandma', null, 0.85),
+    sceneCustomer(rng, 2, 'drunk', null, 0.6),
+  ];
+  numberCustomers(game.customers);
+  game.bank = 1240;
+  game.totalEarned = game.bank;
+  game.nightEarned = 340;
+  game.served = 5;
+  game.bestCombo = 3;
+  game.combo = 3;
+  game.comboTimer = 4;
+  game.popups = [{ x: 600, y: 330, text: 'COMBO x3!', t: 0, life: 2, color: '#ffd34d' }];
+}
+
+function applyServe(game, rng) {
+  resetGame(game, 1);
+  game.screen = 'play';
+  game.nightTime = 20;
+  game.timeLeft = nightInfo(1).duration - game.nightTime;
+  game.kitchen = createKitchen(game.upgrades);
+  game.kitchen.pots[0].state = 'boiling';
+  game.kitchen.pots[0].t = 1.5;
+  game.kitchen.bowl = { noodles: 'perfect', broth: 'shoyu', toppings: ['negi', 'nori', 'egg'] };
+  game.customers = [
+    sceneCustomer(
+      rng,
+      1,
+      'salaryman',
+      { broth: 'shoyu', toppings: ['negi', 'nori', 'egg'], signature: 'Shoyu Classic' },
+      0.9,
+      'happy',
+    ),
+    sceneCustomer(rng, 1, 'student', null, 0.55),
+  ];
+  numberCustomers(game.customers);
+  game.bank = 860;
+  game.totalEarned = game.bank;
+  game.nightEarned = 260;
+  game.served = 3;
+  game.bestCombo = 2;
+  game.combo = 2;
+  game.comboTimer = 3;
+  game.popups = [
+    { x: 600, y: 300, text: '+230', t: 0, life: 2, color: '#7dff8a' },
+    { x: 640, y: 270, text: 'PERFECT!', t: 0, life: 2, color: '#ffd34d' },
+  ];
+}
+
+function applyDayEnd(game) {
+  resetGame(game, 2);
+  game.screen = 'shop';
+  game.upgrades = new Set(['second-pot']);
+  game.kitchen = createKitchen(game.upgrades);
+  game.nightTime = nightInfo(2).duration;
+  game.timeLeft = 0;
+  game.bank = 1730;
+  game.totalEarned = 2140;
+  game.nightEarned = 1240;
+  game.served = 14;
+  game.lost = 1;
+  game.bestCombo = 5;
+}
+
+export function applyShot(game, name, seed = 1) {
+  const rng = mulberry32(seed);
+  if (name === 'rush') applyRush(game, rng);
+  else if (name === 'serve') applyServe(game, rng);
+  else if (name === 'dayend') applyDayEnd(game);
+  else {
+    resetGame(game, 1);
+    game.screen = 'title';
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  game.message = '';
+  game.messageT = 0;
+  return game;
 }
